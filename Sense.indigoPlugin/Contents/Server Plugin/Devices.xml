@@ -1,31 +1,46 @@
 <?xml version="1.0"?>
-
 <Devices>
-	<!-- This custom device illustrates how a plugin can update custom device
-	states which can be used in Device State Changed triggers, conditionals,
-	and inspected on Control Pages. The python runConcurrentThread() method
-	will update the states every second.
-	-->
-	<!--<Device type="custom" id="sensecore">
-		<Name>Sense Core</Name>
-
-	</Device>-->
-
+	<!-- One device per Sense-learned appliance plus "Active Total" (id "core"). All devices
+	share this state list; only Active Total fills dailyKwh / solarW / voltage / hz. -->
 	<Device type="custom" id="sensedevice">
 		<Name>Sense Device</Name>
 		<States>
 			<State id="id">
 				<ValueType>String</ValueType>
-				<TriggerLabel>id</TriggerLabel>
-				<ControlPageLabel>id</ControlPageLabel>
+				<TriggerLabel>Sense id</TriggerLabel>
+				<ControlPageLabel>Sense id</ControlPageLabel>
 			</State>
 			<State id="power">
 				<ValueType>Number</ValueType>
-				<TriggerLabel>power</TriggerLabel>
-				<ControlPageLabel>power</ControlPageLabel>
+				<TriggerLabel>Power (W)</TriggerLabel>
+				<ControlPageLabel>Power (W)</ControlPageLabel>
+			</State>
+			<State id="isOn">
+				<ValueType>Boolean</ValueType>
+				<TriggerLabel>Is running (power above 0 W)</TriggerLabel>
+				<ControlPageLabel>Running</ControlPageLabel>
+			</State>
+			<State id="dailyKwh">
+				<ValueType>Number</ValueType>
+				<TriggerLabel>Today's usage (kWh)</TriggerLabel>
+				<ControlPageLabel>Today (kWh)</ControlPageLabel>
+			</State>
+			<State id="solarW">
+				<ValueType>Number</ValueType>
+				<TriggerLabel>Solar production (W)</TriggerLabel>
+				<ControlPageLabel>Solar (W)</ControlPageLabel>
+			</State>
+			<State id="voltage">
+				<ValueType>String</ValueType>
+				<TriggerLabel>Line voltage (V)</TriggerLabel>
+				<ControlPageLabel>Voltage (V)</ControlPageLabel>
+			</State>
+			<State id="hz">
+				<ValueType>Number</ValueType>
+				<TriggerLabel>Grid frequency (Hz)</TriggerLabel>
+				<ControlPageLabel>Frequency (Hz)</ControlPageLabel>
 			</State>
 		</States>
 		<UiDisplayStateId>power</UiDisplayStateId>
 	</Device>
-
 </Devices>

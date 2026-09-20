@@ -15,10 +15,11 @@ import os
 import time
 from datetime import datetime
 
+from sense import registry
 from sense.client import DEFAULT_TIMEOUT, SenseAuthError, SenseClient, SenseTransientError
+from sense.registry import CORE_ID, IndigoView
 
 DEVICE_TYPE = "sensedevice"
-CORE_ID = "core"
 AUTH_PREF = "senseAuth"  # JSON blob of the tokens returned by SenseClient.connect()
 RECONNECT_INTERVAL = 300  # seconds between login retries after an auth failure
 
@@ -36,10 +37,8 @@ class Plugin(indigo.PluginBase):
         self.doSolar = bool(pluginPrefs.get("solarEnabled", False))
         self.folderID = pluginPrefs.get("folderID", None)
 
-        self.devIDs = list()
-        self.sidFromDev = dict()
-        self.devFromSid = dict()
-        self.rt = dict()  # Sense id -> watts, from the last realtime snapshot
+        self._rename_warned = set()
+        self._duplicate_warned = set()
         self.dontStart = True
 
         self.client = None
@@ -167,45 +166,193 @@ class Plugin(indigo.PluginBase):
     def deviceStartComm(self, dev):
         dev.stateListOrDisplayStateIdChanged()
         if dev.deviceTypeId == DEVICE_TYPE:
-            sID = dev.states["id"]
-            if sID != "":  # state is empty on a device that was only just created
-                self.devIDs.append(sID)
-                self.sidFromDev[int(dev.id)] = sID
-                self.devFromSid[sID] = dev.id
+            self._ensure_identity(dev)
+
+    def _ensure_identity(self, dev):
+        """Make sure the Sense id is in the address, the senseId prop and the `id` state.
+
+        Older versions kept it only in the `id` state; a device whose creation was interrupted
+        may have it only in the props. `address` is a base-class prop a plugin can change only
+        through its pluginProps.
+        """
+        sense_id = self._sense_id_of(dev)
+        if not sense_id:
+            return
+        props = dev.pluginProps
+        if not dev.address or props.get("senseId") != sense_id:
+            props["senseId"] = sense_id
+            props["address"] = sense_id
+            dev.replacePluginPropsOnServer(props)
+            self.logger.debug(f"Stored Sense id {sense_id} on {dev.name}")
+        if str(dev.states.get("id", "") or "") != sense_id:
+            dev.updateStateOnServer(key="id", value=sense_id)
 
     def deviceStopComm(self, dev):
-        if dev.deviceTypeId == DEVICE_TYPE:
-            sID = dev.states["id"]
+        pass
+
+    @staticmethod
+    def _sense_id_of(dev):
+        return str(
+            dev.address or dev.pluginProps.get("senseId", "") or dev.states.get("id", "") or ""
+        )
+
+    def _existing(self):
+        """Every plugin device, enabled or not, keyed by Sense id. The core device included.
+
+        Two devices with the same Sense id (a create interrupted half-way, then retried) are
+        reported once: the enabled one with the lowest id wins and the others are named in a
+        warning so they can be deleted by hand; the plugin never deletes user-visible devices.
+        """
+        views = {}
+        duplicates = {}
+        for dev in sorted(indigo.devices.iter("self"), key=lambda d: (not d.enabled, d.id)):
+            if dev.deviceTypeId != DEVICE_TYPE:
+                continue
+            sense_id = self._sense_id_of(dev)
+            if not sense_id:
+                continue
+            if not dev.address:
+                self._ensure_identity(dev)
+            if sense_id in views:
+                duplicates.setdefault(sense_id, []).append(dev.name)
+                continue
             try:
-                self.devIDs.remove(sID)
-            except ValueError:
-                pass
-            self.sidFromDev.pop(int(dev.id), None)
-            self.devFromSid.pop(sID, None)
+                power = float(dev.states.get("power", 0) or 0)
+            except (TypeError, ValueError):
+                power = 0.0
+            is_on = dev.states.get("isOn")
+            views[sense_id] = IndigoView(
+                dev.id,
+                sense_id,
+                dev.name,
+                bool(dev.enabled),
+                power,
+                None if is_on is None else bool(is_on),
+            )
+        for sense_id, names in duplicates.items():
+            if sense_id not in self._duplicate_warned:
+                self._duplicate_warned.add(sense_id)
+                self.logger.warning(
+                    f"More than one Indigo device has Sense id {sense_id}; using "
+                    f"{views[sense_id].name!r} and ignoring {names} - delete the extras"
+                )
+        return views
+
+    def _folder(self):
+        try:
+            fid = int(self.folderID)
+        except (TypeError, ValueError):
+            fid = 0
+        if fid and fid not in indigo.devices.folders:
+            self.logger.warning(
+                f"Device folder {fid} no longer exists; creating Sense devices at the top level"
+            )
+            fid = 0
+        return fid
+
+    def _create_device(self, sense_id, name):
+        """Create an Indigo device for a Sense id; fall back to a unique name on a clash."""
+        for candidate in (name, f"{name} ({sense_id})"):
+            try:
+                dev = indigo.device.create(
+                    indigo.kProtocol.Plugin,
+                    candidate,
+                    candidate,
+                    deviceTypeId=DEVICE_TYPE,
+                    folder=self._folder(),
+                    props={"senseId": sense_id, "address": sense_id},
+                )
+                break
+            except ValueError as err:
+                if str(err) != "NameNotUniqueError":
+                    self.logger.error(f"Could not create device {name}: {err}")
+                    return None
+                self.logger.warning(
+                    f"Another Indigo device is already called {candidate!r}; "
+                    f"naming the new Sense device {name!r} ({sense_id}) instead"
+                )
+        else:
+            return None
+        dev.updateStatesOnServer(
+            [
+                {"key": "id", "value": sense_id},
+                {"key": "power", "value": 0, "uiValue": "0 w"},
+                {"key": "isOn", "value": False},
+            ]
+        )
+        dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
+        dev.stateListOrDisplayStateIdChanged()
+        self.logger.info(f"Created Sense device {dev.name!r} ({sense_id})")
+        return dev
+
+    def _rename(self, dev, name):
+        old = dev.name
+        dev.name = name
+        try:
+            dev.replaceOnServer()
+        except ValueError as err:
+            dev.name = old
+            if str(err) == "NameNotUniqueError":
+                if dev.id not in self._rename_warned:
+                    self._rename_warned.add(dev.id)
+                    self.logger.warning(
+                        f"Cannot rename {old!r} to {name!r}: another device already has that name"
+                    )
+            else:
+                self.logger.error(f"Cannot rename {old!r}: {err}")
+            return False
+        self._rename_warned.discard(dev.id)
+        return True
+
+    def _push_power(self, dev, watts):
+        watts = int(round(watts))
+        dev.updateStatesOnServer(
+            [
+                {"key": "power", "value": watts, "uiValue": f"{watts} w"},
+                {"key": "isOn", "value": watts > 0},
+            ]
+        )
+        dev.updateStateImageOnServer(
+            indigo.kStateImageSel.PowerOn if watts > 0 else indigo.kStateImageSel.PowerOff
+        )
 
     def createCore(self):
-        try:
-            self.logger.debug("Creating the Active Total device")
-            dev = indigo.device.create(
-                indigo.kProtocol.Plugin,
-                "Active Total",
-                "Active Total",
-                deviceTypeId=DEVICE_TYPE,
-                folder=int(self.folderID),
-            )
-            dev.updateStatesOnServer(
-                [
-                    {"key": "id", "value": CORE_ID},
-                    {"key": "power", "value": "0", "uiValue": "0 w"},
-                ]
-            )
-            dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
-            dev.stateListOrDisplayStateIdChanged()
-            self.devIDs.append(CORE_ID)
-            self.sidFromDev[int(dev.id)] = CORE_ID
-            self.devFromSid[CORE_ID] = dev.id
-        except ValueError:
-            self.logger.error("Could not create the Active Total device.")
+        if CORE_ID in self._existing():
+            return
+        self._create_device(CORE_ID, "Active Total")
+
+    def _update_core(self, realtime, trends):
+        existing = self._existing()
+        if CORE_ID not in existing:
+            self.logger.debug("No Active Total device found - creating it")
+            self.createCore()
+            existing = self._existing()
+            if CORE_ID not in existing:
+                return
+        dev = indigo.devices[existing[CORE_ID].dev_id]
+        watts = int(round(realtime.total_w))
+        wanted = {
+            "power": watts,
+            "isOn": watts > 0,
+            "dailyKwh": round(trends.daily_kwh, 3),
+            "solarW": int(round(realtime.solar_w)),
+            "voltage": "/".join(f"{v:.1f}" for v in realtime.voltage),
+            "hz": round(realtime.hz, 2),
+        }
+        ui = {
+            "power": f"{watts} w",
+            "dailyKwh": f"{trends.daily_kwh:.2f} kWh",
+            "solarW": f"{wanted['solarW']} w",
+            "hz": f"{wanted['hz']} Hz",
+        }
+        changed = [
+            {"key": k, "value": v, **({"uiValue": ui[k]} if k in ui else {})}
+            for k, v in wanted.items()
+            if dev.states.get(k) != v
+        ]
+        if changed:
+            dev.updateStatesOnServer(changed)
+        dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOn)
 
     ########################################
     # Polling
@@ -227,97 +374,50 @@ class Plugin(indigo.PluginBase):
             self._next_connect_attempt = time.time() + int(self.rateLimit)
             return
 
-        self.rt = {sid: int(watts) for sid, (_name, watts) in realtime.devices.items()}
-        active = int(realtime.total_w)
+        active = int(round(realtime.total_w))
         self.logger.debug(
             f"Active: {active} w, daily: {trends.daily_kwh} kWh (via {self.client.realtime_path})"
         )
-        try:
-            core = indigo.devices[self.devFromSid[CORE_ID]]
-            core.updateStateOnServer(key="power", value=str(active), uiValue=f"{active} w")
-            core.updateStateImageOnServer(indigo.kStateImageSel.PowerOn)
-        except KeyError:
-            self.logger.debug("No Active Total device found - creating it")
-            self.createCore()
+        self._update_core(realtime, trends)
 
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
         with open(self.csvActive, "a+") as csv_file:
             csv_file.write(f"{stamp},{active}\n")
 
-        if self.doSolar:
-            self.logger.debug(
-                f"Active solar: {int(realtime.solar_w)} w, daily solar: {trends.daily_solar_kwh} kWh"
+        self._apply(
+            registry.plan(
+                discovered, realtime.devices, self._existing(), include_solar=self.doSolar
             )
+        )
 
-        for d in discovered:
-            sID = d.id
-            if not self.doSolar and sID == "solar":
+    def _apply(self, actions):
+        for action in actions:
+            if isinstance(action, registry.Create):
+                self._create_device(action.sense_id, action.name)
                 continue
-            dName = d.name
-
-            for md in d.merged_ids:
-                if md in self.devIDs:
-                    self.logger.debug(
-                        f"Deleting merged device: {indigo.devices[self.devFromSid[md]].name}"
-                    )
-                    indigo.device.delete(self.devFromSid[md])
-
-            if d.revoked:
-                if sID in self.devIDs:
-                    indigo.device.enable(self.devFromSid[sID], value=False)
+            try:
+                dev = indigo.devices[action.dev_id]
+            except KeyError:
                 continue
-
-            if sID in self.devIDs:
-                dev = indigo.devices[self.devFromSid[sID]]
-                devOldName = dev.name
-                if dev.name != dName:
-                    dev.name = dName
-                    try:
-                        dev.replaceOnServer()
-                    except ValueError as e:
-                        if str(e) == "NameNotUniqueError":
-                            self.logger.debug(
-                                f"Cannot rename {devOldName} to {dName}: another device already has that name"
-                            )
-                        else:
-                            self.logger.error(e)
-                if sID in self.rt:  # currently running per Sense
-                    dev.updateStateOnServer(
-                        key="power", value=str(self.rt[sID]), uiValue=f"{self.rt[sID]} w"
-                    )
-                    dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOn)
-                else:
-                    dev.updateStateOnServer(key="power", value="0", uiValue="0 w")
-                    dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
-            else:
-                self.logger.debug(f"Creating: {dName} ({sID})")
-                try:
-                    dev = indigo.device.create(
-                        indigo.kProtocol.Plugin,
-                        dName,
-                        dName,
-                        deviceTypeId=DEVICE_TYPE,
-                        folder=int(self.folderID),
-                    )
-                    dev.updateStatesOnServer(
-                        [
-                            {"key": "id", "value": str(sID)},
-                            {"key": "power", "value": "0", "uiValue": "0 w"},
-                        ]
-                    )
-                    dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
-                    dev.stateListOrDisplayStateIdChanged()
-                    self.devIDs.append(sID)
-                    self.sidFromDev[int(dev.id)] = sID
-                    self.devFromSid[sID] = dev.id
-                except ValueError as e:
-                    if str(e) == "NameNotUniqueError":
-                        self.logger.debug(
-                            f"Cannot create {dName}: another device already has that name"
-                        )
-                    else:
-                        self.logger.error(e)
-        self.rt = dict()
+            if isinstance(action, registry.UpdatePower):
+                self._push_power(dev, action.watts)
+            elif isinstance(action, registry.Rename):
+                if self._rename(dev, action.name):
+                    self.logger.info(f"Renamed Sense device to {action.name!r} (Sense renamed it)")
+            elif isinstance(action, registry.Retire):
+                self.logger.info(
+                    f"Sense no longer reports {dev.name!r} ({self._sense_id_of(dev)}); "
+                    "disabling it and freeing its name"
+                )
+                self._rename(dev, action.name)
+                indigo.device.enable(dev.id, value=False)
+            elif isinstance(action, registry.Revive):
+                self.logger.info(f"Sense reports {action.name!r} again; re-enabling its device")
+                self._rename(dev, action.name)
+                indigo.device.enable(dev.id, value=True)
+            elif isinstance(action, registry.Delete):
+                self.logger.info(f"Deleting {dev.name!r}: Sense merged it into another appliance")
+                indigo.device.delete(dev.id)
 
     def runConcurrentThread(self):
         try:

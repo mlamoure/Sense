@@ -48,13 +48,17 @@ class Device:
         self.deviceTypeId = deviceTypeId
         self.folderId = folder
         self.pluginProps = pluginProps or {}
-        self.address = ""
         self.enabled = True
         self.states = {}
         self.errorState = None
         self.state_updates = []
         self.image_updates = []
         self.state_list_changed = 0
+
+    @property
+    def address(self):
+        """Read-only in Indigo: a plugin sets it through pluginProps["address"]."""
+        return str(self.pluginProps.get("address", ""))
 
     def updateStatesOnServer(self, state_list):
         self.state_updates.append(state_list)
@@ -79,7 +83,7 @@ class Device:
                 raise ValueError("NameNotUniqueError")
 
     def replacePluginPropsOnServer(self, props):
-        self.pluginProps = props
+        self.pluginProps = dict(props)
 
 
 class IndigoDict(dict):
