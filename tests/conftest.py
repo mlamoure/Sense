@@ -29,9 +29,20 @@ class Devices(dict):
         return iter(list(self.values()))
 
 
+class Folder:
+    def __init__(self, folder_id, name):
+        self.id = folder_id
+        self.name = name
+
+
 class Folders(dict):
+    """`indigo.devices.folders`: id -> name here; iteration yields Folder objects like Indigo."""
+
     def __contains__(self, key):
         return dict.__contains__(self, int(key))
+
+    def __iter__(self):
+        return iter([Folder(i, n) for i, n in self.items()])
 
 
 class Device:

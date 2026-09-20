@@ -47,7 +47,7 @@ class TestConfig:
         p = _plugin(fake_indigo)
         ok, _values, errors = p.validatePrefsConfigUi(dict(PREFS, folderID="999"))
         assert ok is False
-        assert list(errors) == ["folderID", "showAlertText"]
+        assert list(errors) == ["folderID"]
 
     def test_valid_prefs_are_accepted(self, fake_indigo):
         p = _plugin(fake_indigo)
@@ -61,6 +61,36 @@ class TestConfig:
         p = _plugin(fake_indigo)
         ok, _values, errors = p.validatePrefsConfigUi(dict(PREFS, **{field: value}))
         assert ok is False and list(errors) == [field]
+
+    def test_top_level_folder_is_accepted(self, fake_indigo):
+        p = _plugin(fake_indigo)
+        assert p.validatePrefsConfigUi(dict(PREFS, folderID="0")) is True
+
+    def test_folder_list_offers_top_level_and_every_folder(self, fake_indigo):
+        p = _plugin(fake_indigo)
+        fake_indigo.devices.folders[7] = "Energy"
+        assert p.deviceFolderList() == [
+            ("0", "(top level - no folder)"),
+            ("42", "Sense"),
+            ("7", "Energy"),
+        ]
+
+    def test_test_login_button_reports_outcome(self, fake_indigo):
+        p = _plugin(fake_indigo)
+        out = p.testLoginPressed(dict(PREFS))
+        assert out["testLoginResult"] == "OK - monitor monitor-1, live data via realtime_update"
+        FakeSenseable.password_ok = False
+        try:
+            out = p.testLoginPressed(dict(PREFS))
+        finally:
+            FakeSenseable.password_ok = True
+        assert out["testLoginResult"].startswith("Login failed:")
+        FakeSenseable.mfa_required = True
+        try:
+            out = p.testLoginPressed(dict(PREFS))
+        finally:
+            FakeSenseable.mfa_required = False
+        assert "authenticator" in out["testLoginResult"]
 
     def test_prefs_feed_the_client_and_poller(self, fake_indigo):
         p = _plugin(fake_indigo, dict(PREFS, rateLimit="45", apiTimeout="12"))

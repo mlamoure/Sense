@@ -82,19 +82,44 @@ class Plugin(indigo.PluginBase):
         self.indigo_log_handler.setLevel(logging.DEBUG if self.debug else logging.INFO)
         self.plugin_file_handler.setLevel(logging.DEBUG)
 
+    def deviceFolderList(self, filter="", valuesDict=None, typeId="", targetId=0):
+        """Menu items for the folder picker: every device folder plus the top level."""
+        items = [("0", "(top level - no folder)")]
+        for folder in indigo.devices.folders:
+            items.append((str(folder.id), folder.name))
+        return items
+
+    def testLoginPressed(self, valuesDict, typeId="", devId=0):
+        """ConfigUI button: log in with the values in the dialog and report the outcome."""
+        kwargs = {"senseable_factory": SENSEABLE_FACTORY} if SENSEABLE_FACTORY else {}
+        client = SenseClient(
+            str(valuesDict.get("username", "")),
+            str(valuesDict.get("password", "")),
+            timeout=self._int_pref(valuesDict, "apiTimeout", DEFAULT_TIMEOUT),
+            mfa_code=str(valuesDict.get("mfaCode", "")),
+            **kwargs,
+        )
+        try:
+            auth = client.connect()
+            client.refresh_realtime()
+        except SenseAuthError as err:
+            valuesDict["testLoginResult"] = f"Login failed: {err}"
+        except SenseTransientError as err:
+            valuesDict["testLoginResult"] = f"Sense not reachable: {err}"
+        else:
+            valuesDict["testLoginResult"] = (
+                f"OK - monitor {auth['monitor_id']}, live data via {client.realtime_path}"
+            )
+        return valuesDict
+
     def validatePrefsConfigUi(self, valuesDict):
         errorDict = indigo.Dict()
         try:
-            fid = int(valuesDict["folderID"])
-        except (KeyError, TypeError, ValueError):
+            fid = int(valuesDict.get("folderID", 0) or 0)
+        except (TypeError, ValueError):
             fid = -1
-        if fid not in indigo.devices.folders:
-            errorDict["folderID"] = "This field should contain a folder ID"
-            errorDict["showAlertText"] = (
-                f"Folder not found with ID: {fid} \n\nEnsure you have used the ID, not the name "
-                "of the folder.\n\nRight-click the folder you want to use and use 'Copy ID' to "
-                "obtain the correct ID."
-            )
+        if fid != 0 and fid not in indigo.devices.folders:
+            errorDict["folderID"] = "Pick a folder from the list"
         rate = self._int_pref(valuesDict, "rateLimit", -1)
         if rate < MIN_REALTIME_INTERVAL:
             errorDict["rateLimit"] = f"Poll every {MIN_REALTIME_INTERVAL} seconds or more"

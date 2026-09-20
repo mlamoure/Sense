@@ -20,8 +20,8 @@ control page or script can react to an appliance switching on or off.
 
 1. Double-click `Sense.indigoPlugin` (or drop it into Indigo's Plugins folder) and choose
    **Install and Enable**.
-2. **Plugins → Sense Home Energy → Configure**: enter your Sense login, the poll interval and the
-   Indigo folder that Sense devices should be created in.
+2. **Plugins → Sense Home Energy → Configure**: enter your Sense login (click **Test Login** to
+   check it), the poll interval and the Indigo folder that Sense devices should be created in.
 3. Within a minute the plugin creates one device per Sense-detected appliance in that folder,
    plus **Active Total**.
 
@@ -35,8 +35,9 @@ control page or script can react to an appliance switching on or off.
 | API timeout | 30 s | How long one Sense request may take (5–120). |
 | Solar enabled | off | Also create/track the Sense "solar" pseudo-device. |
 | Log power to CSV | off | One row per poll of whole-house watts, one file per day (`activeLog-YYYY-MM-DD.csv`), 30 days kept. |
-| Folder for Sense device creation | — | The **ID** of the Indigo device folder to create devices in (right-click the folder → Copy ID). |
-| Enable debugging | off | Debug detail in the Indigo event log. The plugin's own file log always keeps debug detail. |
+| Folder for Sense devices | — | The Indigo device folder new appliance devices are created in (pick from the list; existing devices are never moved). |
+| Test Login | — | Button: logs in with the values in the dialog and shows the monitor id and which live-data path Sense offers. |
+| Debug logging | off | Debug detail in the Indigo event log. The plugin's own file log always keeps debug detail. |
 
 ## Devices and states
 
