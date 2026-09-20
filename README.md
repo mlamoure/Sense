@@ -8,8 +8,13 @@ control page or script can react to an appliance switching on or off.
 ## Requirements
 
 - Indigo 2023.2 or later (Python 3; tested on Indigo 2025.2 with Python 3.13).
-- A Sense account (email + password). The plugin talks to Sense's cloud API; there is no
-  local connection to the monitor.
+- A Sense account (email + password, optionally with two-factor authentication). The plugin
+  talks to Sense's cloud API; there is no local connection to the monitor.
+- Internet access from the Indigo Mac to pypi.org the first time the plugin starts after an
+  install or update: Indigo reads the bundle's `requirements.txt` and installs the
+  [sense_energy](https://github.com/scottbonline/sense) client into the bundle's
+  `Contents/Packages` folder. If that download fails the plugin stops with an error in the
+  Event Log; reload it once the network is back.
 
 ## Installation
 
@@ -24,7 +29,8 @@ control page or script can react to an appliance switching on or off.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| Username / Password | — | Your Sense account login. Stored in Indigo's plugin preferences. |
+| Username / Password | — | Your Sense account login. Stored in Indigo's plugin preferences. After the first login the plugin keeps Sense's session tokens (also in the preferences) and renews them; the password is only used again if that renewal fails or you change the settings. |
+| Multi-factor code | — | Only for accounts with two-factor authentication: the current code from your authenticator app. It is used once for the login and then cleared. |
 | Max rate | 30 s | Seconds between polls of the Sense API. |
 | Solar enabled | off | Also create/track the Sense "solar" pseudo-device. |
 | Folder for Sense device creation | — | The **ID** of the Indigo device folder to create devices in (right-click the folder → Copy ID). |
@@ -41,6 +47,10 @@ Every device is of type **Sense Device** with two states:
 
 Sense-side renames are mirrored to Indigo. Appliances Sense has revoked or you have deleted in
 the Sense app are disabled in Indigo, not deleted; merged appliances are deleted.
+
+Live data comes from Sense's `realtime_update` endpoint on monitors running firmware 1.64 or
+newer (older firmware falls back to the realtime websocket); the plugin log says which path is
+in use. Daily kWh comes from the current usage-history endpoints.
 
 ## Logs
 

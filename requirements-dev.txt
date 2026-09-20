@@ -1,0 +1,9 @@
+# Development / test dependencies only. Runtime dependencies live in
+# "Sense.indigoPlugin/Contents/Server Plugin/requirements.txt", which Indigo installs itself.
+# Install with: pip install -r requirements-dev.txt
+pytest~=8.4
+black~=25.1
+ruff~=0.13
+
+# Runtime client, same pin as Contents/Server Plugin/requirements.txt (Indigo installs that one).
+sense_energy==0.14.3

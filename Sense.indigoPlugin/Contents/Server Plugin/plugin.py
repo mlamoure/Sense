@@ -1,285 +1,334 @@
-#! /usr/bin/env python
-# -*- coding: utf-8 -*-
-####################
-# Copyright (c) 2016, Perceptive Automation, LLC. All rights reserved.
-# http://www.indigodomo.com
+"""Sense Home Energy Indigo plugin: thin adapter between Indigo and the sense_energy client.
 
-import indigo
+API access lives in ``sense/`` (Indigo-free). This module owns device lifecycle, the prefs
+ConfigUI, the poll loop and pushing state to the Indigo server.
+"""
 
+try:
+    import indigo
+except ImportError:  # unit tests inject a stub
+    pass
+
+import json
+import logging
 import os
-import sys
-
+import time
 from datetime import datetime
 
-import json, requests
+from sense.client import DEFAULT_TIMEOUT, SenseAuthError, SenseClient, SenseTransientError
 
-import sense_energy
-from sense_energy.sense_exceptions import *
+DEVICE_TYPE = "sensedevice"
+CORE_ID = "core"
+AUTH_PREF = "senseAuth"  # JSON blob of the tokens returned by SenseClient.connect()
+RECONNECT_INTERVAL = 300  # seconds between login retries after an auth failure
 
-# Note the "indigo" module is automatically imported and made available inside
-# our global name space by the host process.
+# Tests replace this with a fake Senseable class; None means the real library.
+SENSEABLE_FACTORY = None
 
-################################################################################
+
 class Plugin(indigo.PluginBase):
-	########################################
-	def __init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs):
-		super(Plugin, self).__init__(pluginId, pluginDisplayName, pluginVersion, pluginPrefs)
-		self.debug = pluginPrefs.get("showDebugInfo", False)
-		self.version = pluginVersion
+    def __init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs):
+        super().__init__(pluginId, pluginDisplayName, pluginVersion, pluginPrefs)
+        self.version = pluginVersion
+        self._apply_log_level(pluginPrefs.get("showDebugInfo", False))
 
-		self.rateLimit = pluginPrefs.get("rateLimit", 30)
-		self.doSolar = bool(pluginPrefs.get("solarEnabled", False))
-		self.folderID = pluginPrefs.get("folderID", None)
+        self.rateLimit = pluginPrefs.get("rateLimit", 30)
+        self.doSolar = bool(pluginPrefs.get("solarEnabled", False))
+        self.folderID = pluginPrefs.get("folderID", None)
 
-		self.devIDs = list()
+        self.devIDs = list()
+        self.sidFromDev = dict()
+        self.devFromSid = dict()
+        self.rt = dict()  # Sense id -> watts, from the last realtime snapshot
+        self.dontStart = True
 
-		self.sidFromDev = dict()
-		self.devFromSid = dict()
+        self.client = None
+        self._next_connect_attempt = 0.0
 
-		self.rt  = dict() #RealTime
+        install = indigo.server.getInstallFolderPath()
+        self.csvPath = f"{install}/Preferences/Plugins/{self.pluginId}"
+        self.csvActive = f"{self.csvPath}/activeLog.csv"
+        if not os.path.exists(self.csvPath):
+            os.mkdir(self.csvPath)
+            with open(self.csvActive, "w+") as csv_file:
+                csv_file.write("Timestamp,power\n")
 
-		self.dontStart = True
+    ########################################
+    # Prefs / ConfigUI
+    ########################################
 
-		self.csvPath = "{}/Preferences/Plugins/{}".format(indigo.server.getInstallFolderPath(), self.pluginId)
+    def _apply_log_level(self, debug_enabled):
+        self.debug = bool(debug_enabled)
+        self.indigo_log_handler.setLevel(logging.DEBUG if self.debug else logging.INFO)
+        self.plugin_file_handler.setLevel(logging.DEBUG)
 
-		self.csvActive = "{}/Preferences/Plugins/{}/activeLog.csv".format(indigo.server.getInstallFolderPath(), self.pluginId)
-		self.csvDaily = "{}/Preferences/Plugins/{}/dailyLog.csv".format(indigo.server.getInstallFolderPath(), self.pluginId)
+    def validatePrefsConfigUi(self, valuesDict):
+        fid = int(valuesDict["folderID"])
+        if fid in indigo.devices.folders:
+            return True
+        errorDict = indigo.Dict()
+        errorDict["folderID"] = "This field should contain a folder ID"
+        errorDict["showAlertText"] = (
+            f"Folder not found with ID: {fid} \n\nEnsure you have used the ID, not the name of "
+            "the folder.\n\nRight-click the folder you want to use and use 'Copy ID' to obtain "
+            "the correct ID."
+        )
+        return (False, valuesDict, errorDict)
 
-		if not os.path.exists(self.csvPath):
-			os.mkdir(self.csvPath)
-			csv_file = open(self.csvActive, 'w+')
-			csv_file.write("Timestamp,power\n")
-			csv_file.close()
+    def closedPrefsConfigUi(self, valuesDict, userCancelled):
+        if userCancelled:
+            return
+        self._apply_log_level(valuesDict.get("showDebugInfo", False))
+        self.logger.info("Debug logging " + ("enabled" if self.debug else "disabled"))
+        self.rateLimit = int(valuesDict.get("rateLimit", 30))
+        self.doSolar = bool(valuesDict.get("solarEnabled", False))
+        self.folderID = valuesDict.get("folderID", "")
 
-	def validatePrefsConfigUi(self, valuesDict):
-		fid = int(valuesDict["folderID"])
-		if (fid in indigo.devices.folders):
-			return True
-		else:
-			errorDict = indigo.Dict()
-			errorDict["folderID"] = "This field should contain a folder ID"
-			errorDict["showAlertText"] = "Folder not found with ID: {} \n\nEnsure you have used the ID, not the name of the folder.\n\nRight-click the folder you want to use and use 'Copy ID' to obtain the correct ID.".format(fid)
-			return (False, valuesDict, errorDict)
+        # Credentials may have changed: forget the saved session and log in afresh.
+        self.pluginPrefs.pop(AUTH_PREF, None)
+        self._connect(
+            str(valuesDict.get("username", "")),
+            str(valuesDict.get("password", "")),
+            str(valuesDict.get("mfaCode", "")),
+        )
+        self.createCore()
+        if not self.dontStart:
+            self.getDevices()
 
+    ########################################
+    # Sense session
+    ########################################
 
-	def closedPrefsConfigUi(self, valuesDict, userCancelled):
-		# Since the dialog closed we want to set the debug flag - if you don't directly use
-		# a plugin's properties (and for debugLog we don't) you'll want to translate it to
-		# the appropriate stuff here.
-		if not userCancelled:
-			self.debug = valuesDict.get("showDebugInfo", False)
-			if self.debug:
-				indigo.server.log("Debug logging enabled")
-			else:
-				indigo.server.log("Debug logging disabled")
-			self.rateLimit = int(valuesDict.get("rateLimit", 30))
-			self.debugLog(self.sense.authenticate(str(valuesDict['username']), str(valuesDict['password']), self.rateLimit))
-			self.doSolar = bool(valuesDict.get("solarEnabled", False))
-			self.folderID = valuesDict.get("folderID", "")
+    def _saved_auth(self):
+        raw = self.pluginPrefs.get(AUTH_PREF, "")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            self.logger.debug("Ignoring unreadable saved Sense session")
+            return None
 
-			self.createCore()
+    def _connect(self, username=None, password=None, mfa_code=None):
+        """Build the client and log in. Returns True when polling can proceed."""
+        username = self.pluginPrefs.get("username", "") if username is None else username
+        password = self.pluginPrefs.get("password", "") if password is None else password
+        mfa_code = self.pluginPrefs.get("mfaCode", "") if mfa_code is None else mfa_code
+        self.client = None
+        self._next_connect_attempt = time.time() + RECONNECT_INTERVAL
+        if not username or not password:
+            self.logger.error("Sense username/password not configured (Plugins > Configure).")
+            return False
+        kwargs = {"senseable_factory": SENSEABLE_FACTORY} if SENSEABLE_FACTORY else {}
+        client = SenseClient(
+            str(username),
+            str(password),
+            timeout=DEFAULT_TIMEOUT,
+            saved_auth=self._saved_auth(),
+            mfa_code=str(mfa_code or ""),
+            **kwargs,
+        )
+        try:
+            auth = client.connect()
+        except SenseAuthError as err:
+            self.logger.error(f"Sense login failed: {err}")
+            return False
+        except SenseTransientError as err:
+            self.logger.warning(f"Sense login could not be completed, will retry: {err}")
+            self._next_connect_attempt = time.time() + int(self.rateLimit)
+            return False
+        self.client = client
+        self.pluginPrefs[AUTH_PREF] = json.dumps(auth)
+        # A multi-factor code is single-use; never keep it around.
+        if self.pluginPrefs.get("mfaCode"):
+            self.pluginPrefs["mfaCode"] = ""
+        self.savePluginPrefs()
+        self.logger.info("Connected to Sense (monitor %s)" % auth.get("monitor_id"))
+        return True
 
-			if (self.dontStart == False):
-				self.getDevices()
+    def _ensure_client(self):
+        if self.client is not None:
+            return True
+        if time.time() < self._next_connect_attempt:
+            return False
+        return self._connect()
 
-	def createCore(self):
-		try:
-			self.debugLog("CreateCore")
-			dev = indigo.device.create(indigo.kProtocol.Plugin,"Active Total","Active Total",deviceTypeId="sensedevice",folder=int(self.folderID))
-			newStateList = [
-				{'key':'id', 'value':'core'},
-				{'key':'power', 'value':'0', 'uiValue':'0 w'}
-				]
-			dev.updateStatesOnServer(newStateList)
-			#dev.updateStateOnServer(key='id', value='core')
-			#dev.updateStateOnServer(key='power', value="0", uiValue="0 w")
-			dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
-			dev.stateListOrDisplayStateIdChanged()
+    ########################################
+    # Lifecycle
+    ########################################
 
-			#Add it to self.devIDs
-			devID = dev.id
-			sID = "core"
-			self.devIDs.append(sID)
-			self.sidFromDev[int(devID)] = sID
-			self.devFromSid[sID] = devID
-		except ValueError as e:
-			self.errorLog("Could not create Core device.")
-			pass
+    def startup(self):
+        self.logger.debug(f"startup (plugin {self.version})")
+        self._connect()
 
-	########################################
-	def startup(self):
-		self.debugLog(u"startup called")
-		self.debugLog("Plugin version: {}".format(self.version))
-		#self.debugLog(u"Creating senseable")
-		self.sense = sense_energy.Senseable()
-		self.debugLog(u"Authenticating...")
-		self.debugLog(self.sense.authenticate(str(self.pluginPrefs['username']), str(self.pluginPrefs['password']), self.rateLimit))
-		#for dev in indigo.devices.iter("self"):
-			#indigo.device.delete(dev)
+    def shutdown(self):
+        self.logger.debug("shutdown")
 
-	def shutdown(self):
-		self.debugLog(u"shutdown called")
+    def deviceStartComm(self, dev):
+        dev.stateListOrDisplayStateIdChanged()
+        if dev.deviceTypeId == DEVICE_TYPE:
+            sID = dev.states["id"]
+            if sID != "":  # state is empty on a device that was only just created
+                self.devIDs.append(sID)
+                self.sidFromDev[int(dev.id)] = sID
+                self.devFromSid[sID] = dev.id
 
-	def deviceStartComm(self, dev):
-		#self.debugLog("deviceStartComm called")
-		dev.stateListOrDisplayStateIdChanged()
-		#self.debugLog(dev)
-		if (dev.deviceTypeId == "sensedevice"):
-			devID = dev.id
-			dName = dev.name
-			sID = dev.states['id']
-			if (sID != ""): #The state doesn't exist when the device is first created, so can't populate self.devIDs at this point
-				self.devIDs.append(sID)
-				self.sidFromDev[int(devID)] = sID
-				self.devFromSid[sID] = devID
-			#self.debugLog("Added device {} ({})".format(sID,dName)
-			#self.debugLog(dev.states)
-			#self.debugLog(str(self.devIDs))
+    def deviceStopComm(self, dev):
+        if dev.deviceTypeId == DEVICE_TYPE:
+            sID = dev.states["id"]
+            try:
+                self.devIDs.remove(sID)
+            except ValueError:
+                pass
+            self.sidFromDev.pop(int(dev.id), None)
+            self.devFromSid.pop(sID, None)
 
-	def deviceStopComm(self, dev):
-		#self.debugLog("deviceStopComm called")
-		if (dev.deviceTypeId == "sensedevice"):
-			devID = dev.id
-			sID = dev.states['id']
-			dName = dev.name
-			try:
-				self.devIDs.remove(sID)
-			except:
-				pass
-			self.sidFromDev.pop(int(devID),None)
-			self.devFromSid.pop(sID,None)
-			#self.debugLog("Removed device {} ({})".format(sID,dName))
+    def createCore(self):
+        try:
+            self.logger.debug("Creating the Active Total device")
+            dev = indigo.device.create(
+                indigo.kProtocol.Plugin,
+                "Active Total",
+                "Active Total",
+                deviceTypeId=DEVICE_TYPE,
+                folder=int(self.folderID),
+            )
+            dev.updateStatesOnServer(
+                [
+                    {"key": "id", "value": CORE_ID},
+                    {"key": "power", "value": "0", "uiValue": "0 w"},
+                ]
+            )
+            dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
+            dev.stateListOrDisplayStateIdChanged()
+            self.devIDs.append(CORE_ID)
+            self.sidFromDev[int(dev.id)] = CORE_ID
+            self.devFromSid[CORE_ID] = dev.id
+        except ValueError:
+            self.logger.error("Could not create the Active Total device.")
 
-	def getDevices(self):
-		#self.debugLog("IDs: {}".format(self.devIDs))
-		self.debugLog(u"Getting realtime()")
-		try:
-			#self.debugLog(u"132")
-			self.sense.update_realtime()
-			#self.debugLog(u"134")
-			for i in self.sense._realtime['devices']:
-				#self.debugLog(i)
-				rtid = i['id'] #Get ID from RealTime devices
-				self.rt[rtid] = int(i['w']) #Get power from RealTime devices
-			#self.debugLog(u"138")
-		except SenseAPITimeoutException as e:
-			self.errorLog(e)
-			return
-		self.sense.update_trend_data()
-		active = self.sense.active_power
-		daily = self.sense.daily_usage
-		self.debugLog("Active: {}w".format(active))
-		self.debugLog("Daily: {}kw".format(daily))
-		try:
-			indigo.devices[self.devFromSid['core']].updateStateOnServer(key='power', value=str(int(active)), uiValue=str("{} w".format(int(active))))
-			indigo.devices[self.devFromSid['core']].updateStateImageOnServer(indigo.kStateImageSel.PowerOn)
-		except KeyError as e:
-			self.debugLog("No Core device found - Attempting to recreate.")
-			self.debugLog("Global Active and Daily stats will update on next refresh.")
-			self.debugLog(e)
-			self.createCore()
+    ########################################
+    # Polling
+    ########################################
 
-		lastUpdateTS = self.sense.getRealtimeCall()
-		lastUpdate = datetime.fromtimestamp(lastUpdateTS).strftime("%Y-%m-%d %H:%M:%S.%f")
-		self.debugLog("CSV Output: {},{}".format(lastUpdate,int(active)))
-		csv_file = open(self.csvActive, 'a+')
-		csv_file.write('{0},{1}\n'.format(lastUpdate, int(active)))
-		csv_file.close()
+    def getDevices(self):
+        if not self._ensure_client():
+            return
+        try:
+            realtime = self.client.refresh_realtime()
+            trends = self.client.refresh_trends()
+            discovered = self.client.discovered_devices()
+        except SenseTransientError as err:
+            self.logger.warning(f"Sense poll skipped: {err}")
+            return
+        except SenseAuthError as err:
+            self.logger.error(f"Sense session lost, will log in again: {err}")
+            self.client = None
+            self._next_connect_attempt = time.time() + int(self.rateLimit)
+            return
 
-		if (self.doSolar):
-			self.debugLog("Active Solar {}w:".format(self.sense.active_solar_power))
-			self.debugLog("Daily Solar: {}kw".format(self.sense.daily_production))
+        self.rt = {sid: int(watts) for sid, (_name, watts) in realtime.devices.items()}
+        active = int(realtime.total_w)
+        self.logger.debug(
+            f"Active: {active} w, daily: {trends.daily_kwh} kWh (via {self.client.realtime_path})"
+        )
+        try:
+            core = indigo.devices[self.devFromSid[CORE_ID]]
+            core.updateStateOnServer(key="power", value=str(active), uiValue=f"{active} w")
+            core.updateStateImageOnServer(indigo.kStateImageSel.PowerOn)
+        except KeyError:
+            self.logger.debug("No Active Total device found - creating it")
+            self.createCore()
 
-		for d in self.sense.get_discovered_device_data():
-			sID = d['id']
-			if ((not self.doSolar) and (sID == "solar")):
-				#self.debugLog("Solar disabled: skipping")
-				continue
-			dName = d['name']
-			dRevoked = False
-			if ('tags' in d) and ('Revoked' in d['tags']):
-				if (d['tags']['Revoked'] == 'true'):
-					dRevoked = True
-			if ('tags' in d) and ('UserDeleted' in d['tags']):
-				if (d['tags']['UserDeleted'] == 'true'):
-					dRevoked = True
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        with open(self.csvActive, "a+") as csv_file:
+            csv_file.write(f"{stamp},{active}\n")
 
-			if ('tags' in d) and ('MergedDevices' in d['tags']):
-				mergedDevices = d['tags']['MergedDevices'].split(',')
-				for md in mergedDevices:
-					if (md in self.devIDs):
-						self.debugLog(u"Deleting merged device: {}".format(indigo.devices[self.devFromSid[md]].name))
-						indigo.device.delete(self.devFromSid[md])
+        if self.doSolar:
+            self.logger.debug(
+                f"Active solar: {int(realtime.solar_w)} w, daily solar: {trends.daily_solar_kwh} kWh"
+            )
 
-			if (dRevoked):
-				if (sID in self.devIDs):
-					#indigo.device.delete(self.devFromSid[sID])
-					indigo.device.enable(self.devFromSid[sID], value=False)
-			else:
-				if (sID in self.devIDs):
-					#self.debugLog("sID {} is in self.devIDs".format(sID))
-					dev = indigo.devices[self.devFromSid[sID]]
-					devOldName = dev.name
-					#self.debugLog("sID {} has old name {}".format(sID,devOldName))
-					#self.debugLog("sID {} has new name {}".format(sID,dName))
-					if (dev.name != dName):
-						dev.name = dName
-						try:
-							dev.replaceOnServer()
-						except ValueError as e:
-							if (str(e) == "NameNotUniqueError"):
-								self.debugLog("Trying to rename {} to {}".format(devOldName,dName))
-								self.debugLog("Failed to rename - duplicate device found - please ensure Sense devices are all uniquely named")
-							else:
-								self.errorLog(e)
-					if (str(sID) in self.rt.keys()): #If the device is currently "On" (ie appearing in Realtime on Sense dashboard)
-						dev.updateStateOnServer(key='power', value=str(self.rt[sID]), uiValue=str("{} w".format(self.rt[sID])))
-						dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOn)
-					else:
-						dev.updateStateOnServer(key='power', value="0", uiValue="0 w")
-						dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
-					#dev.stateListOrDisplayStateIdChanged()
-				else:
-					#self.debugLog("sID {} is NOT in self.devIDs".format(sID))
-					self.debugLog("CREATING: {} ({})".format(dName,sID))
-					#self.debugLog(d)
-					try:
-						dev = indigo.device.create(indigo.kProtocol.Plugin,dName,dName,deviceTypeId="sensedevice",folder=int(self.folderID))
-						newStateList = [
-							{'key':'id', 'value':str(sID)},
-							{'key':'power', 'value':'0', 'uiValue':'0 w'}
-							]
-						dev.updateStatesOnServer(newStateList)
-						#dev.updateStateOnServer(key='id', value=str(sID))
-						#dev.updateStateOnServer(key='power', value="0", uiValue="0 w")
-						dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
-						dev.stateListOrDisplayStateIdChanged()
+        for d in discovered:
+            sID = d.id
+            if not self.doSolar and sID == "solar":
+                continue
+            dName = d.name
 
-						#Add it to self.devIDs
-						devID = dev.id
-						self.devIDs.append(sID)
-						self.sidFromDev[int(devID)] = sID
-						self.devFromSid[sID] = devID
-					except ValueError as e:
-						if (str(e) == "NameNotUniqueError"):
-							self.debugLog("Duplicate device found - please ensure Sense devices are all uniquely named")
-						else:
-							self.errorLog(e)
-					#dev.stateListOrDisplayStateIdChanged()
-		self.rt = None
-		self.rt = dict()
-		#self.debugLog("")
+            for md in d.merged_ids:
+                if md in self.devIDs:
+                    self.logger.debug(
+                        f"Deleting merged device: {indigo.devices[self.devFromSid[md]].name}"
+                    )
+                    indigo.device.delete(self.devFromSid[md])
 
-	def runConcurrentThread(self):
-		try:
-			while True:
+            if d.revoked:
+                if sID in self.devIDs:
+                    indigo.device.enable(self.devFromSid[sID], value=False)
+                continue
 
-				if (self.dontStart):
-					self.sleep(10) #Wait for initialisation to finish
-					self.dontStart = False
+            if sID in self.devIDs:
+                dev = indigo.devices[self.devFromSid[sID]]
+                devOldName = dev.name
+                if dev.name != dName:
+                    dev.name = dName
+                    try:
+                        dev.replaceOnServer()
+                    except ValueError as e:
+                        if str(e) == "NameNotUniqueError":
+                            self.logger.debug(
+                                f"Cannot rename {devOldName} to {dName}: another device already has that name"
+                            )
+                        else:
+                            self.logger.error(e)
+                if sID in self.rt:  # currently running per Sense
+                    dev.updateStateOnServer(
+                        key="power", value=str(self.rt[sID]), uiValue=f"{self.rt[sID]} w"
+                    )
+                    dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOn)
+                else:
+                    dev.updateStateOnServer(key="power", value="0", uiValue="0 w")
+                    dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
+            else:
+                self.logger.debug(f"Creating: {dName} ({sID})")
+                try:
+                    dev = indigo.device.create(
+                        indigo.kProtocol.Plugin,
+                        dName,
+                        dName,
+                        deviceTypeId=DEVICE_TYPE,
+                        folder=int(self.folderID),
+                    )
+                    dev.updateStatesOnServer(
+                        [
+                            {"key": "id", "value": str(sID)},
+                            {"key": "power", "value": "0", "uiValue": "0 w"},
+                        ]
+                    )
+                    dev.updateStateImageOnServer(indigo.kStateImageSel.PowerOff)
+                    dev.stateListOrDisplayStateIdChanged()
+                    self.devIDs.append(sID)
+                    self.sidFromDev[int(dev.id)] = sID
+                    self.devFromSid[sID] = dev.id
+                except ValueError as e:
+                    if str(e) == "NameNotUniqueError":
+                        self.logger.debug(
+                            f"Cannot create {dName}: another device already has that name"
+                        )
+                    else:
+                        self.logger.error(e)
+        self.rt = dict()
 
-				self.getDevices()
-				#self.debugLog(self.sense.getRealtimeCall())
-				self.sleep(int(self.rateLimit))
-		except self.StopThread:
-			pass
+    def runConcurrentThread(self):
+        try:
+            while True:
+                if self.dontStart:
+                    self.sleep(10)  # let device comms start before the first poll
+                    self.dontStart = False
+                try:
+                    self.getDevices()
+                except Exception:  # noqa: BLE001 - the poll loop must survive anything
+                    self.logger.exception("Unexpected error while polling Sense")
+                self.sleep(int(self.rateLimit))
+        except self.StopThread:
+            pass

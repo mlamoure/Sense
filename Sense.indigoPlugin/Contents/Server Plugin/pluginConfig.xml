@@ -10,6 +10,12 @@
 	<Field id="password" type="textfield" secure="true">
 		<Label>Password:</Label>
 	</Field>
+	<Field id="mfaCode" type="textfield">
+		<Label>Multi-factor code:</Label>
+	</Field>
+	<Field id="l_mfaCode" type="label">
+		<Label>Only if your Sense account uses two-factor authentication: enter the current code from your authenticator app. It is used once and then cleared.</Label>
+	</Field>
 	
 	<Field id="rateLimit" type="textfield" defaultValue="30">
 		<Label>Max rate:</Label>
