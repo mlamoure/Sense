@@ -31,7 +31,8 @@ control page or script can react to an appliance switching on or off.
 |---|---|---|
 | Username / Password | — | Your Sense account login. Stored in Indigo's plugin preferences. After the first login the plugin keeps Sense's session tokens (also in the preferences) and renews them; the password is only used again if that renewal fails or you change the settings. |
 | Multi-factor code | — | Only for accounts with two-factor authentication: the current code from your authenticator app. It is used once for the login and then cleared. |
-| Max rate | 30 s | Seconds between polls of the Sense API. |
+| Poll interval | 60 s | How often live power is read (30 s minimum). Today's kWh and the appliance list refresh every 5 minutes regardless. |
+| API timeout | 30 s | How long one Sense request may take (5–120). |
 | Solar enabled | off | Also create/track the Sense "solar" pseudo-device. |
 | Folder for Sense device creation | — | The **ID** of the Indigo device folder to create devices in (right-click the folder → Copy ID). |
 | Enable debugging | off | Debug detail in the Indigo event log. The plugin's own file log always keeps debug detail. |
@@ -47,6 +48,10 @@ Every device is of type **Sense Device** with two states:
 
 Sense-side renames are mirrored to Indigo. Appliances Sense has revoked or you have deleted in
 the Sense app are disabled in Indigo, not deleted; merged appliances are deleted.
+
+When Sense is slow or unreachable the plugin keeps the last values, logs at debug level, and
+retries with a growing wait (at most 5 minutes); after three failures in a row it warns in the
+Event Log. A lost session is renewed automatically. Nothing needs a scheduled plugin restart.
 
 Live data comes from Sense's `realtime_update` endpoint on monitors running firmware 1.64 or
 newer (older firmware falls back to the realtime websocket); the plugin log says which path is

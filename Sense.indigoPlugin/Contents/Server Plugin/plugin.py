@@ -12,16 +12,31 @@ except ImportError:  # unit tests inject a stub
 import json
 import logging
 import os
-import time
 from datetime import datetime
 
 from sense import registry
-from sense.client import DEFAULT_TIMEOUT, SenseAuthError, SenseClient, SenseTransientError
+from sense.client import (
+    DEFAULT_TIMEOUT,
+    SenseAuthError,
+    SenseClient,
+    SenseTransientError,
+    TrendSnapshot,
+)
+from sense.poller import (
+    LOGIN,
+    LOGIN_RETRY_AUTH,
+    LOGIN_RETRY_TRANSIENT,
+    MIN_REALTIME_INTERVAL,
+    REALTIME,
+    REALTIME_INTERVAL,
+    TRENDS,
+    Poller,
+)
 from sense.registry import CORE_ID, IndigoView
 
 DEVICE_TYPE = "sensedevice"
 AUTH_PREF = "senseAuth"  # JSON blob of the tokens returned by SenseClient.connect()
-RECONNECT_INTERVAL = 300  # seconds between login retries after an auth failure
+MIN_TIMEOUT, MAX_TIMEOUT = 5, 120
 
 # Tests replace this with a fake Senseable class; None means the real library.
 SENSEABLE_FACTORY = None
@@ -33,16 +48,19 @@ class Plugin(indigo.PluginBase):
         self.version = pluginVersion
         self._apply_log_level(pluginPrefs.get("showDebugInfo", False))
 
-        self.rateLimit = pluginPrefs.get("rateLimit", 30)
+        self.rateLimit = self._int_pref(pluginPrefs, "rateLimit", REALTIME_INTERVAL)
+        self.apiTimeout = self._int_pref(pluginPrefs, "apiTimeout", DEFAULT_TIMEOUT)
         self.doSolar = bool(pluginPrefs.get("solarEnabled", False))
         self.folderID = pluginPrefs.get("folderID", None)
+        self.poller = Poller(realtime_interval=self.rateLimit)
+        self._discovered = []  # last device list from Sense (refreshed on the trend cadence)
+        self._trends = TrendSnapshot(0.0, 0.0)
 
         self._rename_warned = set()
         self._duplicate_warned = set()
         self.dontStart = True
 
         self.client = None
-        self._next_connect_attempt = 0.0
 
         install = indigo.server.getInstallFolderPath()
         self.csvPath = f"{install}/Preferences/Plugins/{self.pluginId}"
@@ -56,32 +74,51 @@ class Plugin(indigo.PluginBase):
     # Prefs / ConfigUI
     ########################################
 
+    @staticmethod
+    def _int_pref(prefs, key, default):
+        try:
+            return int(prefs.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
     def _apply_log_level(self, debug_enabled):
         self.debug = bool(debug_enabled)
         self.indigo_log_handler.setLevel(logging.DEBUG if self.debug else logging.INFO)
         self.plugin_file_handler.setLevel(logging.DEBUG)
 
     def validatePrefsConfigUi(self, valuesDict):
-        fid = int(valuesDict["folderID"])
-        if fid in indigo.devices.folders:
-            return True
         errorDict = indigo.Dict()
-        errorDict["folderID"] = "This field should contain a folder ID"
-        errorDict["showAlertText"] = (
-            f"Folder not found with ID: {fid} \n\nEnsure you have used the ID, not the name of "
-            "the folder.\n\nRight-click the folder you want to use and use 'Copy ID' to obtain "
-            "the correct ID."
-        )
-        return (False, valuesDict, errorDict)
+        try:
+            fid = int(valuesDict["folderID"])
+        except (KeyError, TypeError, ValueError):
+            fid = -1
+        if fid not in indigo.devices.folders:
+            errorDict["folderID"] = "This field should contain a folder ID"
+            errorDict["showAlertText"] = (
+                f"Folder not found with ID: {fid} \n\nEnsure you have used the ID, not the name "
+                "of the folder.\n\nRight-click the folder you want to use and use 'Copy ID' to "
+                "obtain the correct ID."
+            )
+        rate = self._int_pref(valuesDict, "rateLimit", -1)
+        if rate < MIN_REALTIME_INTERVAL:
+            errorDict["rateLimit"] = f"Poll every {MIN_REALTIME_INTERVAL} seconds or more"
+        timeout = self._int_pref(valuesDict, "apiTimeout", -1)
+        if not MIN_TIMEOUT <= timeout <= MAX_TIMEOUT:
+            errorDict["apiTimeout"] = f"Timeout must be {MIN_TIMEOUT}-{MAX_TIMEOUT} seconds"
+        if errorDict:
+            return (False, valuesDict, errorDict)
+        return True
 
     def closedPrefsConfigUi(self, valuesDict, userCancelled):
         if userCancelled:
             return
         self._apply_log_level(valuesDict.get("showDebugInfo", False))
         self.logger.info("Debug logging " + ("enabled" if self.debug else "disabled"))
-        self.rateLimit = int(valuesDict.get("rateLimit", 30))
+        self.rateLimit = self._int_pref(valuesDict, "rateLimit", REALTIME_INTERVAL)
+        self.apiTimeout = self._int_pref(valuesDict, "apiTimeout", DEFAULT_TIMEOUT)
         self.doSolar = bool(valuesDict.get("solarEnabled", False))
         self.folderID = valuesDict.get("folderID", "")
+        self.poller = Poller(realtime_interval=self.rateLimit)
 
         # Credentials may have changed: forget the saved session and log in afresh.
         self.pluginPrefs.pop(AUTH_PREF, None)
@@ -114,15 +151,15 @@ class Plugin(indigo.PluginBase):
         password = self.pluginPrefs.get("password", "") if password is None else password
         mfa_code = self.pluginPrefs.get("mfaCode", "") if mfa_code is None else mfa_code
         self.client = None
-        self._next_connect_attempt = time.time() + RECONNECT_INTERVAL
         if not username or not password:
             self.logger.error("Sense username/password not configured (Plugins > Configure).")
+            self.poller.failed(LOGIN, wait=LOGIN_RETRY_AUTH)
             return False
         kwargs = {"senseable_factory": SENSEABLE_FACTORY} if SENSEABLE_FACTORY else {}
         client = SenseClient(
             str(username),
             str(password),
-            timeout=DEFAULT_TIMEOUT,
+            timeout=self.apiTimeout,
             saved_auth=self._saved_auth(),
             mfa_code=str(mfa_code or ""),
             **kwargs,
@@ -130,13 +167,19 @@ class Plugin(indigo.PluginBase):
         try:
             auth = client.connect()
         except SenseAuthError as err:
-            self.logger.error(f"Sense login failed: {err}")
+            wait = self.poller.failed(LOGIN, wait=LOGIN_RETRY_AUTH)
+            self.logger.error(f"Sense login failed: {err} (next attempt in {int(wait)} s)")
             return False
         except SenseTransientError as err:
-            self.logger.warning(f"Sense login could not be completed, will retry: {err}")
-            self._next_connect_attempt = time.time() + int(self.rateLimit)
+            wait = self.poller.failed(LOGIN, wait=LOGIN_RETRY_TRANSIENT)
+            self.logger.warning(
+                f"Sense login could not be completed: {err} (retry in {int(wait)} s)"
+            )
             return False
         self.client = client
+        self.poller.succeeded(LOGIN)
+        self.poller.reset(REALTIME)
+        self.poller.reset(TRENDS)
         self.pluginPrefs[AUTH_PREF] = json.dumps(auth)
         # A multi-factor code is single-use; never keep it around.
         if self.pluginPrefs.get("mfaCode"):
@@ -148,9 +191,14 @@ class Plugin(indigo.PluginBase):
     def _ensure_client(self):
         if self.client is not None:
             return True
-        if time.time() < self._next_connect_attempt:
+        if not self.poller.due(LOGIN):
             return False
         return self._connect()
+
+    def _drop_session(self, err):
+        self.logger.error(f"Sense session lost, will log in again: {err}")
+        self.client = None
+        self.poller.failed(LOGIN, wait=LOGIN_RETRY_TRANSIENT)
 
     ########################################
     # Lifecycle
@@ -359,26 +407,48 @@ class Plugin(indigo.PluginBase):
     ########################################
 
     def getDevices(self):
+        """One pass of the poll loop: fetch whatever is due and push it to Indigo."""
         if not self._ensure_client():
             return
+        if self.poller.due(TRENDS):
+            self._poll_trends()
+        if self.client is not None and self.poller.due(REALTIME):
+            self._poll_realtime()
+
+    def _poll_trends(self):
         try:
-            realtime = self.client.refresh_realtime()
-            trends = self.client.refresh_trends()
-            discovered = self.client.discovered_devices()
+            self._trends = self.client.refresh_trends()
+            self._discovered = self.client.discovered_devices()
         except SenseTransientError as err:
-            self.logger.warning(f"Sense poll skipped: {err}")
+            wait = self.poller.failed(TRENDS)
+            self.logger.warning(
+                f"Sense trend/device list fetch failed: {err} (retry in {int(wait)} s)"
+            )
             return
         except SenseAuthError as err:
-            self.logger.error(f"Sense session lost, will log in again: {err}")
-            self.client = None
-            self._next_connect_attempt = time.time() + int(self.rateLimit)
+            self._drop_session(err)
             return
+        self.poller.succeeded(TRENDS)
+        self.logger.debug(
+            f"Trends: {self._trends.daily_kwh} kWh today; {len(self._discovered)} Sense devices"
+        )
+
+    def _poll_realtime(self):
+        try:
+            realtime = self.client.refresh_realtime()
+        except SenseTransientError as err:
+            wait = self.poller.failed(REALTIME)
+            level = self.logger.warning if self.poller.failures(REALTIME) > 2 else self.logger.debug
+            level(f"Sense realtime fetch failed: {err} (retry in {int(wait)} s)")
+            return
+        except SenseAuthError as err:
+            self._drop_session(err)
+            return
+        self.poller.succeeded(REALTIME)
 
         active = int(round(realtime.total_w))
-        self.logger.debug(
-            f"Active: {active} w, daily: {trends.daily_kwh} kWh (via {self.client.realtime_path})"
-        )
-        self._update_core(realtime, trends)
+        self.logger.debug(f"Active: {active} w (via {self.client.realtime_path})")
+        self._update_core(realtime, self._trends)
 
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
         with open(self.csvActive, "a+") as csv_file:
@@ -386,7 +456,7 @@ class Plugin(indigo.PluginBase):
 
         self._apply(
             registry.plan(
-                discovered, realtime.devices, self._existing(), include_solar=self.doSolar
+                self._discovered, realtime.devices, self._existing(), include_solar=self.doSolar
             )
         )
 
@@ -421,14 +491,13 @@ class Plugin(indigo.PluginBase):
 
     def runConcurrentThread(self):
         try:
+            self.sleep(5)  # let device comms start before the first poll
+            self.dontStart = False
             while True:
-                if self.dontStart:
-                    self.sleep(10)  # let device comms start before the first poll
-                    self.dontStart = False
                 try:
                     self.getDevices()
                 except Exception:  # noqa: BLE001 - the poll loop must survive anything
                     self.logger.exception("Unexpected error while polling Sense")
-                self.sleep(int(self.rateLimit))
+                self.sleep(1)
         except self.StopThread:
             pass

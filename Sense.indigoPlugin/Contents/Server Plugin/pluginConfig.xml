@@ -17,8 +17,14 @@
 		<Label>Only if your Sense account uses two-factor authentication: enter the current code from your authenticator app. It is used once and then cleared.</Label>
 	</Field>
 	
-	<Field id="rateLimit" type="textfield" defaultValue="30">
-		<Label>Max rate:</Label>
+	<Field id="rateLimit" type="textfield" defaultValue="60">
+		<Label>Poll interval (seconds):</Label>
+	</Field>
+	<Field id="l_rateLimit" type="label">
+		<Label>How often live power is read (30 or more). Daily totals and the appliance list refresh every 5 minutes regardless.</Label>
+	</Field>
+	<Field id="apiTimeout" type="textfield" defaultValue="30">
+		<Label>API timeout (seconds):</Label>
 	</Field>
 
 	<Field id="solarEnabled" type="checkbox">
