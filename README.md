@@ -34,6 +34,7 @@ control page or script can react to an appliance switching on or off.
 | Poll interval | 60 s | How often live power is read (30 s minimum). Today's kWh and the appliance list refresh every 5 minutes regardless. |
 | API timeout | 30 s | How long one Sense request may take (5–120). |
 | Solar enabled | off | Also create/track the Sense "solar" pseudo-device. |
+| Log power to CSV | off | One row per poll of whole-house watts, one file per day (`activeLog-YYYY-MM-DD.csv`), 30 days kept. |
 | Folder for Sense device creation | — | The **ID** of the Indigo device folder to create devices in (right-click the folder → Copy ID). |
 | Enable debugging | off | Debug detail in the Indigo event log. The plugin's own file log always keeps debug detail. |
 
@@ -61,8 +62,10 @@ in use. Daily kWh comes from the current usage-history endpoints.
 
 The plugin's own log (debug detail, rotated daily) is at
 `/Library/Application Support/Perceptive Automation/Indigo <version>/Logs/com.howartp.sense/plugin.log`.
-It also appends one line per poll to
-`/Library/Application Support/Perceptive Automation/Indigo <version>/Preferences/Plugins/com.howartp.sense/activeLog.csv`.
+With "Log power to CSV" on, daily CSV files land in
+`/Library/Application Support/Perceptive Automation/Indigo <version>/Preferences/Plugins/com.howartp.sense/`.
+Older versions wrote a single ever-growing `activeLog.csv` there; it is left alone and can be
+deleted by hand.
 
 ## Development
 

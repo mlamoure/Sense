@@ -11,10 +11,9 @@ except ImportError:  # unit tests inject a stub
 
 import json
 import logging
-import os
-from datetime import datetime
 
 from sense import registry
+from sense.csvlog import CsvLog
 from sense.client import (
     DEFAULT_TIMEOUT,
     SenseAuthError,
@@ -64,11 +63,8 @@ class Plugin(indigo.PluginBase):
 
         install = indigo.server.getInstallFolderPath()
         self.csvPath = f"{install}/Preferences/Plugins/{self.pluginId}"
-        self.csvActive = f"{self.csvPath}/activeLog.csv"
-        if not os.path.exists(self.csvPath):
-            os.mkdir(self.csvPath)
-            with open(self.csvActive, "w+") as csv_file:
-                csv_file.write("Timestamp,power\n")
+        self.csvEnabled = bool(pluginPrefs.get("csvEnabled", False))
+        self._csv = CsvLog(self.csvPath, keep_days=30)
 
     ########################################
     # Prefs / ConfigUI
@@ -117,6 +113,7 @@ class Plugin(indigo.PluginBase):
         self.rateLimit = self._int_pref(valuesDict, "rateLimit", REALTIME_INTERVAL)
         self.apiTimeout = self._int_pref(valuesDict, "apiTimeout", DEFAULT_TIMEOUT)
         self.doSolar = bool(valuesDict.get("solarEnabled", False))
+        self.csvEnabled = bool(valuesDict.get("csvEnabled", False))
         self.folderID = valuesDict.get("folderID", "")
         self.poller = Poller(realtime_interval=self.rateLimit)
 
@@ -450,9 +447,11 @@ class Plugin(indigo.PluginBase):
         self.logger.debug(f"Active: {active} w (via {self.client.realtime_path})")
         self._update_core(realtime, self._trends)
 
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        with open(self.csvActive, "a+") as csv_file:
-            csv_file.write(f"{stamp},{active}\n")
+        if self.csvEnabled:
+            try:
+                self._csv.append(active)
+            except OSError as err:
+                self.logger.warning(f"Could not write the power CSV log: {err}")
 
         self._apply(
             registry.plan(

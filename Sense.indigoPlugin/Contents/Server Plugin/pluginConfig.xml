@@ -31,6 +31,11 @@
 		<Label>Solar enabled:</Label>
 	</Field>
 
+	<Field id="csvEnabled" type="checkbox" defaultValue="false">
+		<Label>Log power to CSV:</Label>
+		<Description>One row per poll in Preferences/Plugins/com.howartp.sense/activeLog-YYYY-MM-DD.csv; 30 days kept.</Description>
+	</Field>
+
 	<Field id="folderID" type="textfield">
 		<Label>Folder for Sense device creation:</Label>
 	</Field>
