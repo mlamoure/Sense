@@ -1,8 +1,20 @@
-ZwaveSensorLogger.indigoPlugin/Contents/Server Plugin/plugin2.py
-*.log
-*doc*
-*zip*
-*lnk*
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Indigo installs Contents/Server Plugin/requirements.txt into this folder on first start;
+# it must never be committed (see Indigo docs, "Python Packages" -> requirements.txt).
+Sense.indigoPlugin/Contents/Packages/
+Sense.indigoPlugin/Contents/Resources/Packages/
+
+# Packaging / OS noise
+*.zip
 Thumbs.db
-*.pyc
-_pycache_
+.DS_Store
+*.log
